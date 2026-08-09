@@ -27,12 +27,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# Non-root user.
-RUN groupadd --system --gid 65532 ocr && \
-    useradd --system --uid 65532 --gid 65532 --home-dir /opt/ocr --shell /sbin/nologin ocr && \
-    chown -R ocr:ocr /opt/ocr
-USER ocr:ocr
-
 EXPOSE 8081
 
 HEALTHCHECK --interval=10s --timeout=10s --start-period=20s --retries=3 \
