@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+
+# local test fixtures (place *.jpg + *.json here to run `python -m app.fastocr --test`)
+app/data/
+data/
+
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

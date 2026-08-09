@@ -1,0 +1,9 @@
+# Web layer
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# OCR engine (pinned to the versions validated in hyperfocus2)
+rapidocr-onnxruntime==1.2.3
+onnxruntime==1.28.0
+opencv-python-headless==5.0.0.93
+numpy==2.5.1
