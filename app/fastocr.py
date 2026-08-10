@@ -17,10 +17,10 @@ pipeline (8.4 s/image -> ~0.12 s/image effective; 77% -> 88% name accuracy):
   * The existing dedup / row-clustering post-processing is reused unchanged.
 
 Usage:
-    python -m app.fastocr data/*.jpg                 # names, one per line
-    python -m app.fastocr --json data/*.jpg          # {"image":..,"names":[..]}
-    python -m app.fastocr --workers 8 --json *.jpg   # parallel (2500 in ~5 min)
-    python -m app.fastocr --test                     # accuracy vs app/data/*.json
+    python -m app.fastocr testdata/1.jpg               # names, one per line
+    python -m app.fastocr --json testdata/*.jpg        # {"image":..,"names":[..]}
+    python -m app.fastocr --workers 8 --json *.jpg     # parallel (2500 in ~5 min)
+    python -m app.fastocr --test                       # accuracy vs testdata/*.json
 """
 from __future__ import annotations
 
@@ -219,7 +219,7 @@ def _best_match(expected: str, candidates: list[str]) -> int:
 
 
 def run_test(workers: int, hybrid: bool = True) -> int:
-    data = Path(__file__).parent / "data"
+    data = Path(__file__).parent.parent / "testdata"
     pairs = []
     for jf in sorted(data.glob("*.json"), key=lambda p: int(p.stem)):
         img = jf.with_suffix(".jpg")

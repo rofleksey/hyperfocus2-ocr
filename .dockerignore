@@ -7,9 +7,9 @@ __pycache__/
 venv/
 env/
 .env
-app/data/
+testdata/
+img/
 data/
-*.log
 *.md
 .pytest_cache/
 .mypy_cache/

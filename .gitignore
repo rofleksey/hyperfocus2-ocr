@@ -6,7 +6,6 @@ venv/
 env/
 .env
 
-# local test fixtures at app/data/ are committed — run `python -m app.fastocr --test`
 
 *.log
 .pytest_cache/

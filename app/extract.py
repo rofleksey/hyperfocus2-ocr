@@ -263,7 +263,7 @@ def main():
 
 def run_test(args):
     """Process every data/N.jpg and compare against data/N.json."""
-    data = Path(__file__).parent / "data"
+    data = Path(__file__).parent.parent / "testdata"
     pairs = []
     for jf in sorted(data.glob("*.json"), key=lambda p: int(p.stem)):
         img = jf.with_suffix(".jpg")
