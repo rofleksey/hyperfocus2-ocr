@@ -6,9 +6,7 @@ venv/
 env/
 .env
 
-# local test fixtures (place *.jpg + *.json here to run `python -m app.fastocr --test`)
-app/data/
-data/
+# local test fixtures at app/data/ are committed — run `python -m app.fastocr --test`
 
 *.log
 .pytest_cache/
