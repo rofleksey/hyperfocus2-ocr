@@ -38,7 +38,7 @@ from pathlib import Path
 
 # --- panel geometry (measured on 1280x720 screenshots) -----------------------
 PANEL_X, PANEL_Y = 0, 300
-PANEL_W, PANEL_H = 265, 295
+PANEL_W, PANEL_H = 265, 420
 SCALE = 4
 # Scaled dimensions.
 OUT_W = PANEL_W * SCALE
@@ -164,9 +164,9 @@ def extract_names(dets: list[Detection]) -> list[str]:
     cands = [d for d in dets if d.y < max_y and len(d.text) >= 1]
     anchors_pool = [d for d in cands if len(d.text) >= 3 and _has_letters(d.text)]
 
-    # Row spacing is ~OUT_H/4.6 (~200px); detections within the same row sit
-    # within ~half that. Use this as the minimum separation between distinct rows.
-    min_sep = OUT_H / 4.6 * 0.5  # ~100px
+    # Row spacing is roughly constant in absolute pixels (~160-180px at 4x).
+    # Use a flat fraction of OUT_H that stays under the minimum observed gap.
+    min_sep = OUT_H / 12  # ~100-140px
 
     # Greedily pick anchor detections: highest score first, skipping any that are
     # too close vertically to an already-chosen anchor.
@@ -182,7 +182,7 @@ def extract_names(dets: list[Detection]) -> list[str]:
 
     # For each anchor row, gather fragments within half the row height and merge
     # them left-to-right. Keep name-like fragments, drop obvious noise.
-    row_half = OUT_H / 4.6 * 0.35
+    row_half = OUT_H / 13
     anchors.sort(key=lambda d: d.y)
     names = []
     for anchor in anchors:
