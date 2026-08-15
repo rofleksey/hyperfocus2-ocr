@@ -15,8 +15,9 @@ white-on-dark names pop, then runs text detection (DBNet) and recognition
 (720p baseline scaled by `height/720`). Overlapping detections are
 deduplicated and greedily clustered into the four survivor rows.
 
-**~0.12 s per image effective, 93% name accuracy on 1080p (87% on 720p).**
-2500 screenshots in ~5 min on an 8-core CPU.
+**93% name accuracy on 1080p, 87% on 720p — ~0.42 s per image
+single-engine at 1080p (~0.27 s at 720p).** The 8-replica production
+deployment keeps a full poll cycle (~2000 images) well under two minutes.
 
 ## Why this exists
 
@@ -24,7 +25,7 @@ deduplicated and greedily clustered into the four survivor rows.
 |---|---|---|---|
 | tesseract + preprocessing | <1 s | ~2 s | Unusable on 14 px text |
 | EasyOCR (PyTorch) | ~4 s | ~8.4 s | ~78% |
-| **RapidOCR (ONNX)** | **~0.2 s** | **~0.15 s** | **87%** |
+| **RapidOCR (ONNX)** | **~0.2 s** | **~0.3–0.4 s** | **93% (1080p) / 87% (720p)** |
 
 RapidOCR's lighter DBNet detector runs faster than EasyOCR's CRAFT on CPU,
 and ONNX Runtime avoids the ~4 s PyTorch import. In-process OpenCV replaces
@@ -139,16 +140,20 @@ screenshots (`.jpg` + `.json` pairs), one subfolder per resolution. Each
 The accuracy harness reports each resolution separately and uses edit
 distance with tolerance `max(2, len/5)`.
 
-<details>
-<summary>Per-image breakdown (hybrid mode, single process)</summary>
+This project is independent and not affiliated with or endorsed by Behaviour
+Interactive, Twitch Interactive, or Valve. "Dead by Daylight" and related
+marks belong to their respective owners.
 
-| Phase | Time |
-|---|---|
-| Crop + 4× bilinear + contrast | ~21 ms |
-| Text detection (DBNet @ native) | ~65 ms |
-| Text recognition (CRNN @ 4×) | ~60 ms |
-| Dedup + cluster | <1 ms |
-| **Total** | **~145 ms** |
+<details>
+<summary>Per-image breakdown (hybrid mode, single process, warmed-up)</summary>
+
+| Phase | 1280×720 | 1920×1080 |
+|---|---|---|
+| Crop + 4× bilinear + contrast | ~25 ms | ~135 ms |
+| Text detection (DBNet @ native) | ~140 ms | ~140 ms |
+| Text recognition (CRNN @ 4×) | ~95 ms | ~120 ms |
+| Dedup + cluster | <1 ms | <1 ms |
+| **Total** | **~270 ms** | **~420 ms** |
 </details>
 
 ## Contrast enhancement

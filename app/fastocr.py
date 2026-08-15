@@ -139,8 +139,9 @@ def process(engine, img_path: str, hybrid: bool = False) -> list[str]:
 
 def _process_hybrid_array(engine, im: np.ndarray) -> list[str]:
     """Detect text boxes on the small native panel (cheap), then recognise on
-    the 4x enhanced crops (accurate). Detection dominates cost and scales with
-    pixels, so running it at ~1x/2x roughly halves per-image time."""
+    the 4x enhanced crops (accurate). Detection runs on the native panel —
+    DBNet resizes its input to a fixed minimum side, so detection cost is
+    similar at both resolutions."""
     geo = Geometry.for_size(im.shape[0], im.shape[1])
     crop = im[geo.y:geo.y + geo.h, geo.x:geo.x + geo.w]
     det_img = enhance(crop)

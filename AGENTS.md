@@ -7,7 +7,8 @@ usernames from the bottom-left HUD panel of Dead by Daylight stream-preview
 screenshots. 1080p (1920×1080) previews are the primary input; 720p
 (1280×720) is fully supported as a fallback.
 
-Target: **~0.15 s per request, 90%+ name accuracy** on CPU.
+Target: **~0.4 s per request at 1080p (~0.27 s at 720p), 90%+ name accuracy**
+on CPU.
 
 ## Project structure
 
@@ -94,8 +95,9 @@ full screenshot (1920x1080 or 1280x720)
 ### Hybrid mode (default)
 
 Detection runs on the small native panel (cheap), recognition on 4× crops
-(accurate). Detection dominates cost and scales with pixel count — running it
-at 1× roughly halves per-image time with no accuracy loss.
+(accurate). Detection runs on the native panel — DBNet resizes its input to a
+fixed minimum side, so detection cost is similar for 720p and 1080p panels.
+Detection at 1× keeps per-image time low with no accuracy loss.
 
 ### Geometry (`app/extract.py`)
 
