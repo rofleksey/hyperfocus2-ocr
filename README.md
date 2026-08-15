@@ -2,22 +2,24 @@
 
 Extracts **Dead by Daylight** survivor nicknames from stream-preview
 screenshots. 1080p (1920×1080) previews are the primary input; 720p
-(1280×720) previews are fully supported as a fallback. A lightweight FastAPI
+(1280×720) remains supported but is **legacy** — accuracy and performance
+targets apply to 1080p only. A lightweight FastAPI
 microservice that preloads a single RapidOCR / PaddleOCR-ONNX engine at
 startup and answers one image per HTTP request.
 
 ![Pipeline overview](img/pipeline.png)
 
 The pipeline crops the translucent HUD panel from the bottom-left corner,
-upscales it 4× with bilinear interpolation, stretches contrast to make faint
-white-on-dark names pop, then runs text detection (DBNet) and recognition
-(CRNN) via ONNX Runtime. The panel geometry adapts to the image resolution
+runs text detection (DBNet) on the native panel, then upscales each detected
+box 4× with bilinear interpolation, stretches contrast to make faint
+white-on-dark names pop, and runs text recognition (CRNN) via ONNX Runtime.
+The panel geometry adapts to the image resolution
 (720p baseline scaled by `height/720`). Overlapping detections are
 deduplicated and greedily clustered into the four survivor rows.
 
-**93% name accuracy on 1080p, 87% on 720p — ~0.42 s per image
-single-engine at 1080p (~0.27 s at 720p).** The 8-replica production
-deployment keeps a full poll cycle (~2000 images) well under two minutes.
+**93% name accuracy on 1080p, 87% on 720p — ~0.32 s per image
+single-engine at 1080p (~0.29 s at 720p).** The 8-replica production
+deployment keeps a full poll cycle (~2000 images) around 80 seconds.
 
 ## Why this exists
 
@@ -25,7 +27,7 @@ deployment keeps a full poll cycle (~2000 images) well under two minutes.
 |---|---|---|---|
 | tesseract + preprocessing | <1 s | ~2 s | Unusable on 14 px text |
 | EasyOCR (PyTorch) | ~4 s | ~8.4 s | ~78% |
-| **RapidOCR (ONNX)** | **~0.2 s** | **~0.3–0.4 s** | **93% (1080p) / 87% (720p)** |
+| **RapidOCR (ONNX)** | **~0.2 s** | **~0.3 s** | **93% (1080p) / 87% (720p)** |
 
 RapidOCR's lighter DBNet detector runs faster than EasyOCR's CRAFT on CPU,
 and ONNX Runtime avoids the ~4 s PyTorch import. In-process OpenCV replaces
@@ -113,8 +115,9 @@ services:
 
 Then point `hyperfocus2` at `http://traefik:8082`.
 
-> 8 replicas on an 8-core CPU gives ~2× throughput (memory-bandwidth bound).
-> A GPU (CUDA EP) would push this to ~10–30 s for 2500 images.
+> 8 replicas on an 8-core CPU gives ~2× throughput (memory-bandwidth bound):
+> a 2000-image poll cycle takes ~80 s. A GPU (CUDA EP) would push this to
+> ~10–30 s for 2500 images.
 
 ## Development & testing
 
@@ -149,11 +152,16 @@ marks belong to their respective owners.
 
 | Phase | 1280×720 | 1920×1080 |
 |---|---|---|
-| Crop + 4× bilinear + contrast | ~25 ms | ~135 ms |
-| Text detection (DBNet @ native) | ~140 ms | ~140 ms |
-| Text recognition (CRNN @ 4×) | ~95 ms | ~120 ms |
+| Crop + detect-panel contrast | ~5 ms | ~10 ms |
+| Text detection (DBNet @ native panel) | ~150 ms | ~175 ms |
+| Per-box 4× bilinear + contrast + warp | <1 ms | ~2 ms |
+| Text recognition (CRNN @ 4× boxes) | ~85 ms | ~110 ms |
 | Dedup + cluster | <1 ms | <1 ms |
-| **Total** | **~270 ms** | **~420 ms** |
+| **Total** | **~250 ms** | **~320 ms** |
+
+Boxes below 78% of crop height are filtered before recognition, so the CRNN
+never sees ability-bar numbers or watermark text. See the performance
+research log in AGENTS.md for the variants that were measured and rejected.
 </details>
 
 ## Contrast enhancement

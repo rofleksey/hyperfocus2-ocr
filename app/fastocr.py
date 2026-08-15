@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Fast DbD survivor-name extraction (RapidOCR / PaddleOCR-ONNX).
 
-~70x higher throughput and ~11pp more accurate than the original EasyOCR
-pipeline (8.4 s/image -> ~0.12 s/image effective; 77% -> 88% name accuracy):
+~110x higher throughput and ~11pp more accurate than the original EasyOCR
+pipeline (8.4 s/image -> ~0.08 s/image effective; 77% -> 90% name accuracy):
 
   * in-process cv2 crop + 4x bilinear upscale + contrast stretch (no ffmpeg /
     ImageMagick subprocesses — those alone cost ~0.5 s/image and are hostile to
@@ -11,15 +11,19 @@ pipeline (8.4 s/image -> ~0.12 s/image effective; 77% -> 88% name accuracy):
     via ONNX Runtime. On CPU this is far lighter than EasyOCR's CRAFT detector
     and recognises the small white-on-dark name glyphs more accurately. ONNX
     models also load in ~0.2 s (vs ~4 s for torch+EasyOCR).
-  * Default "hybrid" mode detects text boxes on the small native panel (cheap)
-    and recognises on the 4x upscaled crops (accurate). 2500 screenshots process
-    in ~5 min on an 8-core CPU via the multiprocessing batch runner.
+  * Hybrid mode detects text boxes on the native panel and recognises on 4x
+    upscaled crops. Only the box regions are upscaled to 4x (the whole-panel
+    upscale cost ~100 ms at 1080p for pixels that are never recognised), and
+    noise boxes below the HUD rows are filtered before recognition.
+    2500 screenshots process in ~7 min on an 8-core CPU via the multiprocessing
+    batch runner (~2x over single-process; the workload is memory-bandwidth
+    bound).
   * The existing dedup / row-clustering post-processing is reused unchanged.
 
 Usage:
     python -m app.fastocr testdata/1.jpg               # names, one per line
     python -m app.fastocr --json testdata/*.jpg        # {"image":..,"names":[..]}
-    python -m app.fastocr --workers 8 --json *.jpg     # parallel (2500 in ~5 min)
+    python -m app.fastocr --workers 8 --json *.jpg     # parallel (2500 in ~7 min)
     python -m app.fastocr --test                       # accuracy vs testdata/*.json
 """
 from __future__ import annotations
@@ -80,6 +84,8 @@ def build_engine(threads: int | None = None, use_angle_cls: bool = False):
     from rapidocr_onnxruntime import RapidOCR
     # Angle classification is pointless here: the HUD name rows are always
     # horizontal, so skip the extra orientation model pass per text crop.
+    # Detection keeps the default min/736 internal input size — shrinking it
+    # costs accuracy (measured -2..-3pp at 1080p).
     return RapidOCR(use_angle_cls=use_angle_cls)
 
 
@@ -137,29 +143,73 @@ def process(engine, img_path: str, hybrid: bool = False) -> list[str]:
     return process_array(engine, im, hybrid=hybrid)
 
 
+def _rotate_crop(img: np.ndarray, points) -> np.ndarray:
+    """Perspective-crop a box from ``img`` (same math as RapidOCR's
+    ``get_rotate_crop_image``: INTER_CUBIC warp, BORDER_REPLICATE, rotate tall
+    crops by 90 deg)."""
+    w = int(max(np.linalg.norm(points[0] - points[1]),
+                np.linalg.norm(points[2] - points[3])))
+    h = int(max(np.linalg.norm(points[0] - points[3]),
+                np.linalg.norm(points[1] - points[2])))
+    pts_std = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    M = cv2.getPerspectiveTransform(points, pts_std)
+    dst = cv2.warpPerspective(img, M, (w, h),
+                              borderMode=cv2.BORDER_REPLICATE,
+                              flags=cv2.INTER_CUBIC)
+    if dst.shape[0] * 1.0 / dst.shape[1] >= 1.5:
+        dst = np.rot90(dst)
+    return dst
+
+
+def _box_crop_4x(crop: np.ndarray, box) -> np.ndarray:
+    """Build the 4x enhanced recognition crop for one native-panel box.
+
+    Only the box region is upscaled — upscaling the whole panel costs ~100 ms
+    at 1080p for pixels that are never recognised. The result is the same crop
+    the old whole-panel path produced: the region content is the exact 4x
+    bilinear upscale of the panel crop (integer scale), enhanced with the same
+    elementwise stretch, then warped at 4x resolution (max |diff| vs the old
+    path measured <= 1 gray level)."""
+    x0 = max(int(np.floor(min(p[0] for p in box))) - 1, 0)
+    y0 = max(int(np.floor(min(p[1] for p in box))) - 1, 0)
+    x1 = min(int(np.ceil(max(p[0] for p in box))) + 1, crop.shape[1])
+    y1 = min(int(np.ceil(max(p[1] for p in box))) + 1, crop.shape[0])
+    reg = crop[y0:y1, x0:x1]
+    up = cv2.resize(reg, ((x1 - x0) * SCALE, (y1 - y0) * SCALE),
+                    interpolation=cv2.INTER_LINEAR)
+    shifted = (box - np.array([x0, y0], dtype=np.float32)) * SCALE
+    return _rotate_crop(enhance(up), shifted)
+
+
 def _process_hybrid_array(engine, im: np.ndarray) -> list[str]:
     """Detect text boxes on the small native panel (cheap), then recognise on
-    the 4x enhanced crops (accurate). Detection runs on the native panel —
-    DBNet resizes its input to a fixed minimum side, so detection cost is
-    similar at both resolutions."""
+    4x enhanced crops (accurate). Boxes below BOTTOM_NOISE_FRAC are filtered
+    before recognition so the CRNN never sees ability-bar numbers or
+    watermark text."""
     geo = Geometry.for_size(im.shape[0], im.shape[1])
     crop = im[geo.y:geo.y + geo.h, geo.x:geo.x + geo.w]
     det_img = enhance(crop)
-    up = cv2.resize(crop, (geo.out_w, geo.out_h), interpolation=cv2.INTER_LINEAR)
-    rec_img = enhance(up)
 
     boxes, _ = engine.text_detector(det_img)
     if boxes is None or len(boxes) < 1:
         return []
     boxes = engine.sorted_boxes(boxes)
-    boxes4 = [b * SCALE for b in boxes]
-    crops = engine.get_crop_img_list(rec_img, boxes4)
-    if engine.use_angle_cls:
-        crops, _, _ = engine.text_cls(crops)
+
+    max_y = geo.out_h * BOTTOM_NOISE_FRAC
+    kept4: list = []
+    crops: list = []
+    for b in boxes:
+        b4 = b * SCALE
+        if min(p[1] for p in b4) > max_y:
+            continue
+        kept4.append(b4)
+        crops.append(_box_crop_4x(crop, b))
+    if not crops:
+        return []
     rec_res, _ = engine.text_recognizer(crops)
 
     dets: list[Detection] = []
-    for b, (text, score) in zip(boxes4, rec_res):
+    for b, (text, score) in zip(kept4, rec_res):
         ys = [p[1] for p in b]; xs = [p[0] for p in b]
         y = int(min(ys)); x = int(min(xs))
         if y > geo.out_h * BOTTOM_NOISE_FRAC:
@@ -262,8 +312,8 @@ def main():
                     help="ONNX threads per worker (multiprocessing only)")
     ap.add_argument("--full", action="store_true",
                     help="detect AND recognise at 4x (more conservative). Both "
-                         "modes score ~88%% on the test set; default hybrid is "
-                         "faster and meets the 2500-imgs-in-5-min target.")
+                         "modes score ~90%% on the test set; default hybrid is "
+                         "faster and meets the batch-runner target.")
     args = ap.parse_args()
 
     hybrid = not args.full

@@ -5,10 +5,10 @@
 A standalone, stateless HTTP microservice that extracts the four survivor
 usernames from the bottom-left HUD panel of Dead by Daylight stream-preview
 screenshots. 1080p (1920×1080) previews are the primary input; 720p
-(1280×720) is fully supported as a fallback.
+(1280×720) still works but is **legacy** — performance and accuracy targets
+apply to 1080p only.
 
-Target: **~0.4 s per request at 1080p (~0.27 s at 720p), 90%+ name accuracy**
-on CPU.
+Target: **~0.3 s per request at 1080p, 93%+ name accuracy** on CPU.
 
 ## Project structure
 
@@ -75,29 +75,29 @@ full screenshot (1920x1080 or 1280x720)
         ├──► enhance (contrast stretch) ──► text detection (DBNet, ONNX)
         │                                       │
         ▼                                    bounding boxes
-   upscale 4× bilinear
+   filter noise boxes (BOTTOM_NOISE_FRAC)
         │
-        ▼  enhance (contrast stretch)
-   enhanced 4× panel
-        │
-        ▼  crop text regions from boxes
+        ▼  per box: crop region, upscale 4× bilinear, enhance, warp
    text crops (4×)
         │
         ▼  text recognition (CRNN, ONNX)
    (text, confidence) per box
         │
         ▼  dedup overlapping boxes
-        ▼  filter noise (BOTTOM_NOISE_FRAC)
         ▼  greedy cluster into 4 rows (min_sep)
    ["Name1", "Name2", "Name3", "Name4"]
 ```
 
 ### Hybrid mode (default)
 
-Detection runs on the small native panel (cheap), recognition on 4× crops
-(accurate). Detection runs on the native panel — DBNet resizes its input to a
-fixed minimum side, so detection cost is similar for 720p and 1080p panels.
-Detection at 1× keeps per-image time low with no accuracy loss.
+Detection runs on the small native panel (cheap), recognition on 4x enhanced
+crops (accurate). Detection keeps RapidOCR's default internal input size
+(min/736) — shrinking it measurably costs accuracy, see the performance
+research log. Only the box regions are upscaled to 4x: the old whole-panel
+upscale + contrast stretch cost ~100 ms at 1080p for pixels that are never
+recognised, and the per-box path produces crops within ≤1 gray level of the
+old ones. Boxes below `BOTTOM_NOISE_FRAC` are filtered *before* recognition
+so the CRNN never sees ability-bar numbers or watermark text.
 
 ### Geometry (`app/extract.py`)
 
@@ -210,6 +210,45 @@ Known failure modes:
   degrade into visually similar Latin text (e.g. "Штора" → "TUropa").
 - **Overlay interference** — streamer overlays or hooked-survivor nameplates
   near the top of the panel can displace or merge with a name row.
+
+## Performance research log (2026-08)
+
+Measured on the 8-core dev host (memory-bandwidth bound) with the accuracy
+harness over the 36 fixtures. Per-image times are interleaved A/B medians
+(decode excluded); det/rec times are phase-level.
+
+| Variant | det 1080p | rec input | 1080p acc | 720p acc |
+|---|---|---|---|---|
+| v3 models, old whole-panel pipeline (ex-prod) | ~175 ms | panel@4x | 93% | 87% |
+| **v3 models, per-box upscale (shipped)** | ~175 ms | box@4x, ≤1 gray-level diff | **93%** | **87%** |
+
+Ruled out, with data:
+
+- **Detection at native panel size** (`det_limit_type=max`, no internal
+  upscale): det 174→54 ms, but names come back as fragments — 1080p dropped
+  to 87% (names split, e.g. `RebeccaChambers` → `chambers`). DBNet needs the
+  ~39 px effective text height that min/736 gives; a 21 px glyph is not
+  enough.
+- **Smaller min-side limits**: min/704 → 93% (-1 pp, ~no time gain),
+  min/672 → 91%, min/640 → 91%. The 1–2 pp drop was not worth ~30–50 ms.
+- **Prescaled crops with max-type**: pre=1.25–2.0 all cap at the 736 long
+  side → effective text ~23 px → 83–87%. max/960 + 1.5× prescale → 91% at
+  1080p (99 ms det) but 83% on legacy 720p — rejected.
+- **PP-OCRv4 models (rapidocr 1.4.4)**: 94% at 1080p but det is slower
+  (~270 ms vs ~175 ms) and 720p drops to 86%. Not worth the API churn.
+  Note: 1.4.4 has no Python 3.14 wheels — the dev venv must stay on 1.2.3
+  (production Docker is 3.12, which is fine either way).
+- **INT8 dynamic quantization of the rec model**: 2× slower on this CPU.
+- **PP-OCRv4 rec model swapped into the v3 engine**: slower on identical
+  crops (29 vs 22 ms).
+- **OpenVINO EP**: `onnxruntime-openvino` does not register the provider in
+  a slim container — fell back to CPU. Untested on production hardware.
+
+Shipped result: **~1.3× faster per image (404 → 328 ms median mixed-res),
+zero accuracy change (93%/87%).** Detection (~175 ms) is now the dominant
+phase; the CRNN (~25–110 ms depending on box count) is second. If a future
+accuracy trade-off ever becomes acceptable, the min/640 config is the first
+cheap win (~50 ms for -2 pp at 1080p).
 
 ## Notes
 
