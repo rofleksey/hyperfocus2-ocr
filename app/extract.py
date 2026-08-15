@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Extract survivor usernames from Dead by Daylight (1280x720) screenshots.
+"""Extract survivor usernames from Dead by Daylight screenshots.
+
+The HUD scales proportionally with the stream resolution, so the panel
+geometry is derived from the 1280x720 baseline by the image-height ratio
+(1920x1080 previews -> factor 1.5). Both resolutions (and anything else
+Twitch serves) run through the same pipeline.
 
 Pipeline (quality first, then speed):
   1. ffmpeg crops the bottom-left HUD panel and upscales it 4x (Lanczos). The
@@ -37,15 +42,69 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # --- panel geometry (measured on 1280x720 screenshots) -----------------------
+# The HUD is laid out proportionally to the stream resolution: these are the
+# 720p baseline values and every other resolution scales them by height/720.
+# Twitch previews come as 1920x1080 (factor 1.5) or 1280x720 (factor 1.0).
+# The panel top position varies between streamers (HUD scale setting), so the
+# crop gets extra headroom above the measured panel top; the panel always
+# reaches the bottom edge of the frame, so the crop extends to it.
 PANEL_X, PANEL_Y = 0, 300
 PANEL_W, PANEL_H = 265, 420
+PANEL_TOP_MARGIN = 28
 SCALE = 4
-# Scaled dimensions.
+# Scaled dimensions for the 720p baseline.
 OUT_W = PANEL_W * SCALE
 OUT_H = PANEL_H * SCALE
 # Ability-bar numbers / icons sit at the very bottom of the crop; anything below
 # this y-fraction is discarded as noise.
-BOTTOM_NOISE_FRAC = 0.82
+BOTTOM_NOISE_FRAC = 0.78
+
+
+@dataclass(frozen=True)
+class Geometry:
+    """HUD panel geometry for one image resolution (pixels at native size).
+
+    ``x, y, w, h`` — panel rectangle inside the full screenshot.
+    ``out_w, out_h`` — panel rectangle after the SCALE upscale (the space in
+    which detection boxes and clustering constants live).
+    """
+    x: int
+    y: int
+    w: int
+    h: int
+    out_w: int
+    out_h: int
+
+    @classmethod
+    def for_size(cls, img_h: int, img_w: int = 0) -> "Geometry":
+        ratio = img_h / 720.0
+        w = round(PANEL_W * ratio)
+        h = round((PANEL_H + PANEL_TOP_MARGIN) * ratio)
+        return cls(x=round(PANEL_X * ratio),
+                   y=round((PANEL_Y - PANEL_TOP_MARGIN) * ratio),
+                   w=w, h=h, out_w=w * SCALE, out_h=h * SCALE)
+
+
+def jpeg_size(path: str) -> tuple[int, int]:
+    """Read (width, height) from a JPEG SOF marker, no imaging deps."""
+    with open(path, "rb") as f:
+        data = f.read(1 << 20)
+    i = 2
+    while i + 9 < len(data):
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                      0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            return (int.from_bytes(data[i + 7:i + 9], "big"),
+                    int.from_bytes(data[i + 5:i + 7], "big"))
+        if 0xD0 <= marker <= 0xD9 or marker == 0x01:
+            i += 2
+            continue
+        seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+        i += 2 + seg_len
+    raise ValueError(f"no JPEG SOF marker in {path}")
 
 
 @dataclass
@@ -58,11 +117,11 @@ class Detection:
     text: str
 
 
-def ffmpeg_crop_scale(src: str, dst: str) -> None:
+def ffmpeg_crop_scale(src: str, dst: str, geo: Geometry) -> None:
     """Crop the HUD panel and upscale it with ffmpeg."""
     vf = (
-        f"crop={PANEL_W}:{PANEL_H}:{PANEL_X}:{PANEL_Y},"
-        f"scale={OUT_W}:{OUT_H}:flags=lanczos"
+        f"crop={geo.w}:{geo.h}:{geo.x}:{geo.y},"
+        f"scale={geo.out_w}:{geo.out_h}:flags=lanczos"
     )
     subprocess.run(
         ["ffmpeg", "-y", "-i", src, "-vf", vf, "-frames:v", "1", dst,
@@ -115,10 +174,10 @@ def ocr_image(reader, path: str) -> list[Detection]:
 
 
 def _has_letters(text: str) -> bool:
-    """True if the token has >=2 letters (Latin or Cyrillic) — filters pure
+    """True if the token has >=1 letter (Latin or Cyrillic) — filters pure
     noise like '5', '???', '|'."""
     n = sum(1 for c in text if c.isalpha())
-    return n >= 2
+    return n >= 1
 
 
 def _score(d: Detection) -> float:
@@ -148,7 +207,7 @@ def _dedup(dets: list[Detection]) -> list[Detection]:
     return kept
 
 
-def extract_names(dets: list[Detection]) -> list[str]:
+def extract_names(dets: list[Detection], out_h: int = OUT_H) -> list[str]:
     """Pick the four survivor rows and reconstruct each name.
 
     Strategy: deduplicate overlapping detections (from multi-pass merging), then
@@ -157,16 +216,19 @@ def extract_names(dets: list[Detection]) -> list[str]:
     merge any neighbouring fragments that belong to the same name.
     """
     dets = _dedup(dets)
-    max_y = int(OUT_H * BOTTOM_NOISE_FRAC)
+    max_y = int(out_h * BOTTOM_NOISE_FRAC)
     # Anchors must look like real names: >=3 chars and contain letters. Short
     # fragments (single Cyrillic chars, numbers) are only merged into rows, never
     # chosen as row representatives.
     cands = [d for d in dets if d.y < max_y and len(d.text) >= 1]
-    anchors_pool = [d for d in cands if len(d.text) >= 3 and _has_letters(d.text)]
+    anchors_pool = [d for d in cands
+                    if (len(d.text) >= 3 and _has_letters(d.text))
+                    or (len(d.text) >= 1 and d.conf >= 0.45 and _has_letters(d.text))]
 
     # Row spacing is roughly constant in absolute pixels (~160-180px at 4x).
-    # Use a flat fraction of OUT_H that stays under the minimum observed gap.
-    min_sep = OUT_H / 12  # ~100-140px
+    # Use a flat fraction of out_h that stays under the minimum observed gap,
+    # including compact layouts (character-select screens with ~200px rows).
+    min_sep = out_h / 14
 
     # Greedily pick anchor detections: highest score first, skipping any that are
     # too close vertically to an already-chosen anchor.
@@ -182,12 +244,15 @@ def extract_names(dets: list[Detection]) -> list[str]:
 
     # For each anchor row, gather fragments within half the row height and merge
     # them left-to-right. Keep name-like fragments, drop obvious noise.
-    row_half = OUT_H / 13
+    row_half = out_h / 14
     anchors.sort(key=lambda d: d.y)
     names = []
     for anchor in anchors:
         row = [d for d in cands if abs(d.y - anchor.y) <= row_half]
-        named = [d for d in row if _has_letters(d.text)]
+        # Fragments merged into a row must look like text (>=2 letters); single
+        # stray glyphs are more likely noise than part of a name.
+        named = [d for d in row
+                 if sum(1 for c in d.text if c.isalpha()) >= 2]
         pool = named if named else [anchor]
         pool.sort(key=lambda d: d.x)
         if len(pool) == 1:
@@ -223,15 +288,17 @@ def process(reader, image_path: str, tmpdir: str, dual: bool = True) -> list[str
     Clustering + dedup then naturally picks the higher-confidence variant per
     row. With ``dual=False`` only pass B runs (~2x faster).
     """
+    w, h = jpeg_size(image_path)
+    geo = Geometry.for_size(h, w)
     scaled = os.path.join(tmpdir, "scaled.png")
     enhanced = os.path.join(tmpdir, "enhanced.png")
-    ffmpeg_crop_scale(image_path, scaled)
+    ffmpeg_crop_scale(image_path, scaled, geo)
     magick_enhance(scaled, enhanced)
     if dual:
         dets = ocr_image(reader, scaled) + ocr_image(reader, enhanced)
     else:
         dets = ocr_image(reader, enhanced)
-    return extract_names(dets)
+    return extract_names(dets, geo.out_h)
 
 
 def main():
@@ -261,30 +328,63 @@ def main():
                     print(n)
 
 
+def load_fixtures(testdata: Path) -> list[tuple[str, Path, Path]]:
+    """Return [(label, image, json), ...] across all resolution subfolders.
+
+    Fixtures live in testdata/<resolution>/N.jpg + N.json (e.g. 720p/, 1080p/).
+    """
+    pairs: list[tuple[str, Path, Path]] = []
+    for folder in sorted(p for p in testdata.iterdir() if p.is_dir()):
+        for jf in sorted(folder.glob("*.json"),
+                         key=lambda p: (len(p.stem), p.stem)):
+            img = jf.with_suffix(".jpg")
+            if img.exists():
+                pairs.append((folder.name, img, jf))
+    return pairs
+
+
+def check_placeholders(pairs: list[tuple[str, Path, Path]]) -> None:
+    """Abort if any fixture JSON still has unfilled XXXX name slots."""
+    bad = []
+    for _, _, jf in pairs:
+        names = json.loads(jf.read_text())["survivors"]
+        if any("XXXX" in str(n) for n in names):
+            bad.append(str(jf))
+    if bad:
+        raise SystemExit(
+            "unfilled XXXX placeholders remain in:\n  " + "\n  ".join(bad))
+
+
 def run_test(args):
-    """Process every data/N.jpg and compare against data/N.json."""
+    """Process every testdata/<res>/N.jpg and compare against its N.json,
+    reporting accuracy per resolution."""
     data = Path(__file__).parent.parent / "testdata"
-    pairs = []
-    for jf in sorted(data.glob("*.json"), key=lambda p: int(p.stem)):
-        img = jf.with_suffix(".jpg")
-        if img.exists():
-            pairs.append((img, jf))
+    pairs = load_fixtures(data)
+    if not pairs:
+        raise SystemExit("no fixtures found under testdata/")
+    check_placeholders(pairs)
 
     reader = build_reader()
-    total, matched = 0, 0
+    totals: dict[str, list[int]] = {}
     with tempfile.TemporaryDirectory() as tmpdir:
-        for img, jf in pairs:
+        for label, img, jf in pairs:
             expected = json.loads(jf.read_text())["survivors"]
             got = process(reader, str(img), tmpdir)
-            print(f"### {img.name}")
+            totals.setdefault(label, [0, 0])
+            print(f"### [{label}] {img.name}")
             for exp in expected:
-                total += 1
+                totals[label][0] += 1
                 ok = _best_match(exp, got)
-                matched += ok
+                totals[label][1] += ok
                 mark = "OK " if ok else "   "
                 print(f"  [{mark}] exp={exp!r}")
             print(f"       got={got}")
-    print(f"\n=== {matched}/{total} names matched ===")
+    grand = [sum(c[i] for c in totals.values()) for i in range(2)]
+    for label, (t, m) in totals.items():
+        pct = 100 * m // t if t else 0
+        print(f"=== {label}: {m}/{t} matched ({pct}%) ===")
+    pct = 100 * grand[1] // grand[0] if grand[0] else 0
+    print(f"=== total: {grand[1]}/{grand[0]} matched ({pct}%) ===")
 
 
 def _edit_distance(a: str, b: str) -> int:

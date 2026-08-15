@@ -3,10 +3,11 @@
 ## Goal
 
 A standalone, stateless HTTP microservice that extracts the four survivor
-usernames from the bottom-left HUD panel of Dead by Daylight 1280×720
-stream-preview screenshots.
+usernames from the bottom-left HUD panel of Dead by Daylight stream-preview
+screenshots. 1080p (1920×1080) previews are the primary input; 720p
+(1280×720) is fully supported as a fallback.
 
-Target: **~0.15 s per request, 87%+ name accuracy** on CPU.
+Target: **~0.15 s per request, 90%+ name accuracy** on CPU.
 
 ## Project structure
 
@@ -14,9 +15,10 @@ Target: **~0.15 s per request, 87%+ name accuracy** on CPU.
 hyperfocus2-ocr/
 ├── app/
 │   ├── __init__.py          # Package docstring
-│   ├── extract.py           # Geometry constants, Detection dataclass,
-│   │                          dedup, row-clustering (extract_names),
-│   │                          EasyOCR wrappers, CLI, test runner
+│   ├── extract.py           # Geometry (resolution-adaptive), Detection
+│   │                          dataclass, dedup, row-clustering
+│   │                          (extract_names), EasyOCR wrappers, CLI,
+│   │                          test runner, fixture loading
 │   ├── fastocr.py           # RapidOCR-ONNX pipeline: in-process cv2,
 │   │                          hybrid detect+recognise, multiprocessing,
 │   │                          CLI, test runner
@@ -24,7 +26,9 @@ hyperfocus2-ocr/
 │   │                          asyncio.Lock, run_in_executor
 │   └── server.py            # FastAPI: POST /ocr, GET /healthz,
 │                              lifespan-based engine startup, env-var config
-├── testdata/                # 18 labelled screenshots (jpg + json)
+├── testdata/
+│   ├── 720p/                # 18 labelled 720p screenshots (jpg + json)
+│   └── 1080p/               # 18 labelled 1080p screenshots (jpg + json)
 ├── img/                     # README illustrations (not in Docker image)
 ├── Dockerfile               # python:3.12-slim, uvicorn entrypoint
 ├── requirements.txt
@@ -62,15 +66,15 @@ HTTP request (JPEG bytes)
 ## Pipeline details
 
 ```
-full 1280×720 screenshot
+full screenshot (1920x1080 or 1280x720)
         │
-        ▼  crop 265×420+0+300
-   native panel (265×420)
+        ▼  crop HUD panel (resolution-adaptive, see Geometry)
+   native panel
         │
         ├──► enhance (contrast stretch) ──► text detection (DBNet, ONNX)
         │                                       │
         ▼                                    bounding boxes
-   upscale 4× bilinear (1060×1680)
+   upscale 4× bilinear
         │
         ▼  enhance (contrast stretch)
    enhanced 4× panel
@@ -93,30 +97,40 @@ Detection runs on the small native panel (cheap), recognition on 4× crops
 (accurate). Detection dominates cost and scales with pixel count — running it
 at 1× roughly halves per-image time with no accuracy loss.
 
-### Geometry constants (`app/extract.py`)
+### Geometry (`app/extract.py`)
+
+The HUD is laid out proportionally to the stream resolution, so panel
+geometry is derived from the measured 1280×720 baseline scaled by
+`height/720` (`Geometry.for_size`). Twitch previews arrive as 1920×1080
+(factor 1.5) or 1280×720 (factor 1.0); both — and any other size — run
+through the same pipeline.
 
 | Constant | Value | Meaning |
 |---|---|---|
 | `PANEL_X, PANEL_Y` | `0, 300` | Top-left of HUD panel in 1280×720 |
-| `PANEL_W × PANEL_H` | `265 × 420` | Panel dimensions |
+| `PANEL_W × PANEL_H` | `265 × 420` | Panel dimensions (720p baseline) |
+| `PANEL_TOP_MARGIN` | `28` | Extra headroom above the panel top (720p units). The panel top varies between streamers (HUD scale setting), the panel always reaches the bottom frame edge. |
 | `SCALE` | `4` | Upscale factor |
-| `OUT_W × OUT_H` | `1060 × 1680` | 4× scaled dimensions |
-| `BOTTOM_NOISE_FRAC` | `0.82` | Fraction of panel height below which detections are discarded |
+| `BOTTOM_NOISE_FRAC` | `0.78` | Fraction of crop height below which detections are discarded |
 
+Effective crops: 1280×720 → `265×448+0+272`; 1920×1080 → `398×672+0+408`.
 If the HUD layout changes in a future DbD patch, adjust these constants.
 
 ### Clustering (`extract_names` in `app/extract.py`)
 
 1. **Dedup** overlapping detections (keep highest-scored).
-2. **Noise filter** — discard detections with `y > OUT_H × BOTTOM_NOISE_FRAC`
+2. **Noise filter** — discard detections with `y > out_h × BOTTOM_NOISE_FRAC`
    (ability-bar numbers, watermark text).
-3. **Anchor selection** — pick up to 4 candidates (length ≥ 3, ≥ 2 letters)
-   greedily by score, enforcing minimum vertical separation `min_sep`.
+3. **Anchor selection** — pick up to 4 candidates greedily by score,
+   enforcing minimum vertical separation `min_sep`. A candidate must look
+   like a name: ≥3 chars with ≥1 letter, OR any length with conf ≥ 0.45
+   (recovers very short names like "m").
 4. **Row merge** — for each anchor, gather fragments within `row_half` px
    vertically, merge left-to-right.
 
-`min_sep` and `row_half` are calibrated fractions of `OUT_H` (`/12` and `/13`
-respectively) so that the clustering adapts if panel geometry changes.
+`min_sep` and `row_half` are calibrated fractions of `out_h` (`/14` each) so
+that the clustering adapts to panel geometry and to compact layouts (e.g.
+character-select screens with ~200 px rows at 4×).
 
 ## Development workflow
 
@@ -152,18 +166,20 @@ python -m app.fastocr --workers 8 --json testdata/*.jpg
 
 ### Add a test fixture
 
-1. Drop a 1280×720 screenshot as `testdata/N.jpg`.
-2. Create `testdata/N.json`:
+1. Drop a screenshot as `testdata/<res>/N.jpg` (`res` = `720p` or `1080p`).
+2. Create `testdata/<res>/N.json`:
    ```json
    {"survivors": ["Player1", "Player2", "Player3", "Player4"]}
    ```
 3. Run `python -m app.fastocr --test` and verify the new image is picked up.
 
+The test runner refuses to run if any `XXXX` placeholder remains in a JSON.
+
 ### Smoke test
 
 ```bash
 curl -s http://localhost:8081/healthz
-curl -s --data-binary @testdata/18.jpg \
+curl -s --data-binary @testdata/1080p/1.jpg \
      -H 'Content-Type: image/jpeg' \
      http://localhost:8081/ocr | jq .
 ```
@@ -180,17 +196,18 @@ The Docker image excludes `testdata/`, `img/`, `*.md`, and `.git/`
 
 ## Accuracy
 
-Current baseline: **87%** (63/72 names across 18 fixtures, RapidOCR hybrid
-mode, 265×420 px crop). Evaluation uses edit distance with tolerance
-`max(2, len(name)//5)`.
+Current baseline: **1080p 93%** (67/72) and **720p 87%** (63/72), RapidOCR
+hybrid mode, resolution-adaptive crop. Evaluation uses edit distance with
+tolerance `max(2, len(name)//5)`.
 
 Known failure modes:
-- **Undetected names** — the DBNet detector occasionally misses names on
-  very faint or heavily obscured panels (~2-3 per 72).
+- **Faint panels** — names over bright game areas lose contrast and read as
+  fragments or garbage (~1-2 per 72).
 - **Garbled characters** — CRNN hallucinates on borderline pixels, producing
-  1-3 char errors (~4-5 per 72). Most common with Cyrillic glyphs.
-- **Watermark interference** — the "CREATOR DEAD BY DAYLIGHT" text near the
-  panel bottom can leak through the noise filter on some screenshots.
+  1-3 char errors (~2-3 per 72). Most common with Cyrillic glyphs, which
+  degrade into visually similar Latin text (e.g. "Штора" → "TUropa").
+- **Overlay interference** — streamer overlays or hooked-survivor nameplates
+  near the top of the panel can displace or merge with a name row.
 
 ## Notes
 

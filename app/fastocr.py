@@ -34,15 +34,13 @@ import numpy as np
 
 try:  # when imported as part of the `app` package (server / `python -m app.fastocr`)
     from .extract import (
-        Detection, extract_names,
-        PANEL_X, PANEL_Y, PANEL_W, PANEL_H, SCALE, OUT_W, OUT_H,
-        BOTTOM_NOISE_FRAC,
+        Detection, Geometry, extract_names, load_fixtures, check_placeholders,
+        BOTTOM_NOISE_FRAC, SCALE,
     )
 except ImportError:  # when run as a standalone script
     from extract import (
-        Detection, extract_names,
-        PANEL_X, PANEL_Y, PANEL_W, PANEL_H, SCALE, OUT_W, OUT_H,
-        BOTTOM_NOISE_FRAC,
+        Detection, Geometry, extract_names, load_fixtures, check_placeholders,
+        BOTTOM_NOISE_FRAC, SCALE,
     )
 
 # NOTE: ONNX thread count is set per-worker in _init_worker(), not globally, so
@@ -92,14 +90,19 @@ def enhance(bgr: np.ndarray) -> np.ndarray:
     return (np.power(norm / 255.0, 1.0 / 1.15) * 255.0).astype(np.uint8)
 
 
-def preprocess_array(im: np.ndarray) -> np.ndarray:
-    """Crop the HUD panel, 4x upscale and contrast-stretch a decoded image."""
-    crop = im[PANEL_Y:PANEL_Y + PANEL_H, PANEL_X:PANEL_X + PANEL_W]
-    up = cv2.resize(crop, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
-    return enhance(up)
+def preprocess_array(im: np.ndarray) -> tuple[np.ndarray, Geometry]:
+    """Crop the HUD panel, 4x upscale and contrast-stretch a decoded image.
+
+    The panel geometry adapts to the image resolution (720p baseline scaled by
+    height/720), so 1280x720 and 1920x1080 previews both work.
+    """
+    geo = Geometry.for_size(im.shape[0], im.shape[1])
+    crop = im[geo.y:geo.y + geo.h, geo.x:geo.x + geo.w]
+    up = cv2.resize(crop, (geo.out_w, geo.out_h), interpolation=cv2.INTER_LINEAR)
+    return enhance(up), geo
 
 
-def preprocess(img_path: str) -> np.ndarray:
+def preprocess(img_path: str) -> tuple[np.ndarray, Geometry]:
     im = cv2.imread(img_path)
     if im is None:
         raise FileNotFoundError(img_path)
@@ -110,21 +113,21 @@ def process_array(engine, im: np.ndarray, hybrid: bool = False) -> list[str]:
     """Run the OCR pipeline on a decoded BGR image (no disk I/O)."""
     if hybrid:
         return _process_hybrid_array(engine, im)
-    rec = preprocess_array(im)
+    rec, geo = preprocess_array(im)
     result, _elapse = engine(rec)
     dets: list[Detection] = []
     if result:
         for box, text, score in result:
             ys = [p[1] for p in box]; xs = [p[0] for p in box]
             y = int(min(ys)); x = int(min(xs))
-            if y > OUT_H * BOTTOM_NOISE_FRAC:
+            if y > geo.out_h * BOTTOM_NOISE_FRAC:
                 continue
             dets.append(Detection(
                 y=y, x=x,
                 w=int(max(xs) - min(xs)), h=int(max(ys) - min(ys)),
                 conf=float(score), text=text.strip(),
             ))
-    return extract_names(dets)
+    return extract_names(dets, geo.out_h)
 
 
 def process(engine, img_path: str, hybrid: bool = False) -> list[str]:
@@ -138,9 +141,10 @@ def _process_hybrid_array(engine, im: np.ndarray) -> list[str]:
     """Detect text boxes on the small native panel (cheap), then recognise on
     the 4x enhanced crops (accurate). Detection dominates cost and scales with
     pixels, so running it at ~1x/2x roughly halves per-image time."""
-    crop = im[PANEL_Y:PANEL_Y + PANEL_H, PANEL_X:PANEL_X + PANEL_W]
+    geo = Geometry.for_size(im.shape[0], im.shape[1])
+    crop = im[geo.y:geo.y + geo.h, geo.x:geo.x + geo.w]
     det_img = enhance(crop)
-    up = cv2.resize(crop, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
+    up = cv2.resize(crop, (geo.out_w, geo.out_h), interpolation=cv2.INTER_LINEAR)
     rec_img = enhance(up)
 
     boxes, _ = engine.text_detector(det_img)
@@ -157,13 +161,13 @@ def _process_hybrid_array(engine, im: np.ndarray) -> list[str]:
     for b, (text, score) in zip(boxes4, rec_res):
         ys = [p[1] for p in b]; xs = [p[0] for p in b]
         y = int(min(ys)); x = int(min(xs))
-        if y > OUT_H * BOTTOM_NOISE_FRAC:
+        if y > geo.out_h * BOTTOM_NOISE_FRAC:
             continue
         dets.append(Detection(
             y=y, x=x, w=int(max(xs) - min(xs)), h=int(max(ys) - min(ys)),
             conf=float(score), text=text.strip(),
         ))
-    return extract_names(dets)
+    return extract_names(dets, geo.out_h)
 
 
 # --- multiprocessing --------------------------------------------------------
@@ -220,24 +224,29 @@ def _best_match(expected: str, candidates: list[str]) -> int:
 
 def run_test(workers: int, hybrid: bool = True) -> int:
     data = Path(__file__).parent.parent / "testdata"
-    pairs = []
-    for jf in sorted(data.glob("*.json"), key=lambda p: int(p.stem)):
-        img = jf.with_suffix(".jpg")
-        if img.exists():
-            pairs.append((str(img), jf))
-    results = process_many([p for p, _ in pairs], workers, hybrid=hybrid)
+    pairs = load_fixtures(data)
+    if not pairs:
+        print("no fixtures found under testdata/")
+        return 0
+    check_placeholders(pairs)
+    results = process_many([str(p) for _, p, _ in pairs], workers, hybrid=hybrid)
     rmap = {p: n for p, n in results}
-    total = matched = 0
-    for img, jf in pairs:
+    totals: dict[str, list[int]] = {}
+    for label, img, jf in pairs:
         expected = json.loads(jf.read_text())["survivors"]
-        got = rmap[img]
+        got = rmap[str(img)]
+        totals.setdefault(label, [0, 0])
         for exp in expected:
-            total += 1
-            matched += _best_match(exp, got)
-        print(f"### {Path(img).name}")
+            totals[label][0] += 1
+            totals[label][1] += _best_match(exp, got)
+        print(f"### [{label}] {img.name}")
         print(f"    got={got}")
-    pct = 100 * matched // total if total else 0
-    print(f"\n=== {matched}/{total} matched ({pct}%) ===")
+    for label, (t, m) in totals.items():
+        pct = 100 * m // t if t else 0
+        print(f"=== {label}: {m}/{t} matched ({pct}%) ===")
+    grand = [sum(c[i] for c in totals.values()) for i in range(2)]
+    pct = 100 * grand[1] // grand[0] if grand[0] else 0
+    print(f"=== total: {grand[1]}/{grand[0]} matched ({pct}%) ===")
     return pct
 
 

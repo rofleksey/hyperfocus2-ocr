@@ -1,20 +1,22 @@
 # hyperfocus2-ocr
 
-Extracts **Dead by Daylight** survivor nicknames from 1280×720 stream-preview
-screenshots. A lightweight FastAPI microservice that preloads a single
-RapidOCR / PaddleOCR-ONNX engine at startup and answers one image per HTTP
-request.
+Extracts **Dead by Daylight** survivor nicknames from stream-preview
+screenshots. 1080p (1920×1080) previews are the primary input; 720p
+(1280×720) previews are fully supported as a fallback. A lightweight FastAPI
+microservice that preloads a single RapidOCR / PaddleOCR-ONNX engine at
+startup and answers one image per HTTP request.
 
 ![Pipeline overview](img/pipeline.png)
 
 The pipeline crops the translucent HUD panel from the bottom-left corner,
 upscales it 4× with bilinear interpolation, stretches contrast to make faint
 white-on-dark names pop, then runs text detection (DBNet) and recognition
-(CRNN) via ONNX Runtime. Overlapping detections are deduplicated and
-greedily clustered into the four survivor rows.
+(CRNN) via ONNX Runtime. The panel geometry adapts to the image resolution
+(720p baseline scaled by `height/720`). Overlapping detections are
+deduplicated and greedily clustered into the four survivor rows.
 
-**~0.12 s per image effective, 87% name accuracy.** 2500 screenshots in
-~5 min on an 8-core CPU.
+**~0.12 s per image effective, 93% name accuracy on 1080p (87% on 720p).**
+2500 screenshots in ~5 min on an 8-core CPU.
 
 ## Why this exists
 
@@ -116,24 +118,26 @@ Then point `hyperfocus2` at `http://traefik:8082`.
 ## Development & testing
 
 ```bash
-# Accuracy report against labelled fixtures (testdata/*.json)
+# Accuracy report against labelled fixtures (testdata/*/*.json)
 python -m app.fastocr --test
 
 # Single image
-python -m app.fastocr --json testdata/18.jpg
+python -m app.fastocr --json testdata/1080p/1.jpg
 
 # Batch (parallel)
-python -m app.fastocr --workers 8 --json testdata/*.jpg
+python -m app.fastocr --workers 8 --json testdata/*/*.jpg
 ```
 
-Test fixtures live in `testdata/` — 18 labelled screenshots (`.jpg` + `.json`
-pairs). Each `.json`:
+Test fixtures live in `testdata/720p/` and `testdata/1080p/` — labelled
+screenshots (`.jpg` + `.json` pairs), one subfolder per resolution. Each
+`.json`:
 
 ```json
 {"survivors": ["NameOne", "PlayerTTV", "ThirdName", "FourthName"]}
 ```
 
-The accuracy harness uses edit distance with tolerance `max(2, len/5)`.
+The accuracy harness reports each resolution separately and uses edit
+distance with tolerance `max(2, len/5)`.
 
 <details>
 <summary>Per-image breakdown (hybrid mode, single process)</summary>
@@ -160,6 +164,9 @@ without artefacts that would confuse the recogniser.
 
 ![HUD panel crop area](img/crop-annotated.png)
 
-Only the bottom-left 265×420 px panel is processed — the rest of the
-1280×720 frame is discarded. Everything below 82% of panel height (ability-bar
+Only the bottom-left panel is processed — the rest of the frame is discarded.
+The crop is resolution-adaptive: measured on 1280×720 as `265×448+0+272`,
+scaled by `height/720` for other sizes (1920×1080 → `398×672+0+408`). The
+extra top headroom absorbs streamer-specific HUD shifts; the crop extends to
+the bottom frame edge. Everything below 78% of crop height (ability-bar
 numbers, watermark text) is filtered as noise.
